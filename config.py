@@ -29,3 +29,8 @@ ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() != "false"
 # Instagram / Meta
 INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID", "")
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
+
+# Coinbase Advanced Trade (crypto)
+COINBASE_API_KEY_NAME    = os.getenv("COINBASE_API_KEY_NAME", "")
+COINBASE_API_PRIVATE_KEY = os.getenv("COINBASE_API_PRIVATE_KEY", "")
+COINBASE_PAPER           = os.getenv("COINBASE_PAPER", "true").lower() != "false"

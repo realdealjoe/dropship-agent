@@ -18,10 +18,10 @@ from scheduler import build_scheduler
 
 
 def _bootstrap_trading_history():
-    """On first deploy, load 6 years of historical price data if DB is empty."""
+    """On first deploy, load 6 years of stock history if DB is empty."""
     import trading_db as tdb
     import sqlite3
-    conn = sqlite3.connect(tdb.DB_PATH)
+    conn  = sqlite3.connect(tdb.DB_PATH)
     count = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
     conn.close()
     if count == 0:
@@ -32,9 +32,30 @@ def _bootstrap_trading_history():
             from scripts.load_history import load_all
             load_all()
         except Exception as e:
-            print(f"[main] Warning: history load failed: {e}")
+            print(f"[main] Warning: stock history load failed: {e}")
     else:
         print(f"[main] Price history ready ({count} rows)")
+
+
+def _bootstrap_crypto_history():
+    """On first deploy, load crypto history if no crypto symbols exist in DB."""
+    import trading_db as tdb
+    import sqlite3
+    from config import COINBASE_API_KEY_NAME
+    if not COINBASE_API_KEY_NAME:
+        return
+    conn  = sqlite3.connect(tdb.DB_PATH)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM price_history WHERE symbol LIKE '%-USD'"
+    ).fetchone()[0]
+    conn.close()
+    if count == 0:
+        print("[main] No crypto history found — loading from Coinbase...")
+        try:
+            from scripts.load_crypto_history import main as load_crypto
+            load_crypto()
+        except Exception as e:
+            print(f"[main] Warning: crypto history load failed: {e}")
 
 
 def cmd_serve():
@@ -42,6 +63,7 @@ def cmd_serve():
     import trading_db as tdb
     tdb.init_trading_db()
     _bootstrap_trading_history()
+    _bootstrap_crypto_history()
     scheduler = build_scheduler()
     scheduler.start()
     print("[main] Scheduler started.")

@@ -10,7 +10,7 @@ Schedule (all times UTC):
   12:00 Tue/Fri   Social media posts
   13:35 Mon-Fri   Stock trading — morning session
   19:45 Mon-Fri   Stock trading — end-of-day session
-  */4 hours       Order tracking sync
+  */4 hours       Order tracking sync + crypto trading
 """
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -106,6 +106,18 @@ def _trading_weekly_review():
     print(f"[scheduler] Weekly review done:\n{result[:500]}\n")
 
 
+# ── Crypto trading agent ─────────────────────────────────────────────────────
+
+def _crypto_session():
+    from config import COINBASE_API_KEY_NAME
+    if not COINBASE_API_KEY_NAME:
+        print("[scheduler] Crypto: COINBASE_API_KEY_NAME not set, skipping")
+        return
+    from agents.crypto_trading import run_crypto_session
+    print("\n[scheduler] Running crypto trading session...")
+    run_crypto_session()
+
+
 # ── Build scheduler ───────────────────────────────────────────────────────────
 
 def build_scheduler() -> BackgroundScheduler:
@@ -145,5 +157,9 @@ def build_scheduler() -> BackgroundScheduler:
     # Trading self-review — Sunday 01:00 UTC (runs before product sourcing at 02:00)
     scheduler.add_job(_trading_weekly_review, CronTrigger(day_of_week="sun", hour=1),
                       id="trading_review",    replace_existing=True)
+
+    # Crypto trading — every 4 hours, 24/7
+    scheduler.add_job(_crypto_session,        CronTrigger(hour="0,4,8,12,16,20"),
+                      id="crypto_trading",    replace_existing=True)
 
     return scheduler
