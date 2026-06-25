@@ -1,0 +1,10 @@
+.env
+*.db
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.venv/
+venv/
+tiktok_queue.txt
+scripts/__pycache__/
