@@ -6,6 +6,7 @@ from typing import Optional
 
 # DATA_DIR is /data on Railway (persistent volume), local dir otherwise
 _DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+os.makedirs(_DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(_DATA_DIR, "dropship.db")
 
 
