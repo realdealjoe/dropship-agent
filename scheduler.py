@@ -158,8 +158,8 @@ def build_scheduler() -> BackgroundScheduler:
     scheduler.add_job(_trading_weekly_review, CronTrigger(day_of_week="sun", hour=1),
                       id="trading_review",    replace_existing=True)
 
-    # Crypto trading — every 4 hours, 24/7
-    scheduler.add_job(_crypto_session,        CronTrigger(hour="0,4,8,12,16,20"),
+    # Crypto trading — every 2 hours, 24/7
+    scheduler.add_job(_crypto_session,        CronTrigger(hour="*/2"),
                       id="crypto_trading",    replace_existing=True)
 
     return scheduler

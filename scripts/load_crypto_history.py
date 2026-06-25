@@ -19,7 +19,8 @@ KEY_NAME    = os.getenv("COINBASE_API_KEY_NAME", "")
 _KEY_B64    = os.getenv("COINBASE_API_PRIVATE_KEY", "")
 BASE_URL    = "https://api.coinbase.com"
 
-SYMBOLS     = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "AVAX-USD"]
+SYMBOLS     = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD",
+               "DOGE-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "UNI-USD"]
 YEARS       = 6
 CHUNK_DAYS  = 300   # safe under Coinbase's 350-candle limit
 

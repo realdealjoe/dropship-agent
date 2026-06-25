@@ -1,14 +1,15 @@
 """
-Crypto trading agent — runs every 4 hours via scheduler, 24/7.
-Watches BTC-USD, ETH-USD, SOL-USD, DOGE-USD, AVAX-USD on Coinbase Advanced Trade.
+Crypto trading agent — runs every 2 hours via scheduler, 24/7.
+Watches 10 coins on Coinbase Advanced Trade.
 Logs all trades to trading.db alongside the stock bot's journal.
 
-Edge data sources:
+Intelligence sources:
   - Fear & Greed Index (alternative.me)
-  - BTC funding rates (Binance perpetuals)
-  - Whale alert / on-chain large transfers (whale-alert.io public feed)
-  - Multi-timeframe candles (4h + 1d)
-  - Coinbase market data
+  - OKX funding rates (crowded position detector)
+  - CoinGecko trending coins + market movers + volume spikes
+  - BTC dominance + alt season detection
+  - Multi-timeframe: 6h + daily candles
+  - On-chain: BTC network activity
 """
 import os
 import time
@@ -31,10 +32,22 @@ KEY_NAME     = os.getenv("COINBASE_API_KEY_NAME", "")
 _KEY_B64     = os.getenv("COINBASE_API_PRIVATE_KEY", "")
 BASE_URL     = "https://api.coinbase.com"
 
-WATCHLIST        = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "AVAX-USD"]
-MAX_POSITION_PCT = 0.25   # up to 25% per trade when conviction is high
-CRASH_THRESHOLD  = 0.08   # if BTC drops 8%+ in 24h → skip session
-DAILY_LOSS_LIMIT = 0.15   # stop trading if portfolio drops 15% in a day
+WATCHLIST = [
+    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD",
+    "DOGE-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "UNI-USD",
+]
+
+# CoinGecko symbol → Coinbase product_id mapping
+CG_TO_CB = {
+    "btc": "BTC-USD", "eth": "ETH-USD", "sol": "SOL-USD",
+    "xrp": "XRP-USD", "ada": "ADA-USD", "doge": "DOGE-USD",
+    "avax": "AVAX-USD", "link": "LINK-USD", "dot": "DOT-USD", "uni": "UNI-USD",
+}
+
+MAX_POSITION_PCT = 0.25   # up to 25% of portfolio per trade
+MIN_USD_RESERVE  = 0.20   # always keep 20% in USD
+CRASH_THRESHOLD  = 0.08   # skip session if BTC drops 8%+ in 24h
+DAILY_LOSS_LIMIT = 0.15   # stop trading if portfolio drops 15% in a session
 
 _client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -73,18 +86,23 @@ def _cb_post(path: str, body: dict) -> dict:
 # ── Market Intelligence ────────────────────────────────────────────────────────
 
 def get_fear_and_greed() -> dict:
-    """Crypto Fear & Greed Index (0=extreme fear, 100=extreme greed)."""
     try:
-        r = httpx.get("https://api.alternative.me/fng/?limit=2", timeout=10)
+        r    = httpx.get("https://api.alternative.me/fng/?limit=3", timeout=10)
         data = r.json().get("data", [])
-        if data:
-            today     = data[0]
-            yesterday = data[1] if len(data) > 1 else data[0]
+        if len(data) >= 2:
+            today, yesterday = data[0], data[1]
             return {
-                "value":           int(today["value"]),
-                "classification":  today["value_classification"],
-                "yesterday_value": int(yesterday["value"]),
-                "trend":           "rising" if int(today["value"]) > int(yesterday["value"]) else "falling",
+                "value":          int(today["value"]),
+                "classification": today["value_classification"],
+                "yesterday":      int(yesterday["value"]),
+                "trend":          "rising" if int(today["value"]) > int(yesterday["value"]) else "falling",
+                "signal": (
+                    "STRONG BUY — extreme fear, historically best entry"  if int(today["value"]) < 20 else
+                    "BUY — fear zone"                                      if int(today["value"]) < 40 else
+                    "NEUTRAL"                                              if int(today["value"]) < 60 else
+                    "CAUTION — greed zone, consider taking profits"        if int(today["value"]) < 80 else
+                    "SELL — extreme greed, markets historically top here"
+                ),
             }
     except Exception as e:
         return {"error": str(e)}
@@ -92,8 +110,8 @@ def get_fear_and_greed() -> dict:
 
 
 def get_funding_rates() -> dict:
-    """BTC/ETH/SOL perpetual futures funding rates from OKX (positive = longs paying shorts)."""
-    pairs = {"BTC-USD-SWAP": "BTC-USD", "ETH-USD-SWAP": "ETH-USD", "SOL-USD-SWAP": "SOL-USD"}
+    pairs = {"BTC-USD-SWAP": "BTC-USD", "ETH-USD-SWAP": "ETH-USD",
+             "SOL-USD-SWAP": "SOL-USD", "XRP-USD-SWAP": "XRP-USD"}
     rates = {}
     for inst_id, label in pairs.items():
         try:
@@ -101,61 +119,33 @@ def get_funding_rates() -> dict:
             data = r.json().get("data", [{}])[0]
             rate = float(data.get("fundingRate", 0)) * 100
             rates[label] = {
-                "funding_rate_pct": round(rate, 4),
-                "signal": "bearish" if rate > 0.05 else "bullish" if rate < -0.02 else "neutral",
-                "note": "Longs very crowded — reversal risk" if rate > 0.1
-                        else "Shorts crowded — squeeze possible" if rate < -0.05
-                        else "Neutral funding",
+                "rate_pct": round(rate, 4),
+                "signal": (
+                    "BEARISH — longs very crowded, reversal risk" if rate > 0.1 else
+                    "bearish"                                      if rate > 0.05 else
+                    "BULLISH — shorts crowded, squeeze likely"     if rate < -0.05 else
+                    "neutral"
+                ),
             }
         except Exception as e:
             rates[label] = {"error": str(e)}
     return rates
 
 
-def get_onchain_signals() -> dict:
-    """
-    BTC on-chain signals from public Blockchain.com API.
-    Tracks exchange netflow proxy and mempool pressure.
-    """
-    signals = {}
-    try:
-        # Mempool size (congestion = high activity = bullish pressure)
-        r = httpx.get("https://api.blockchain.info/stats", timeout=10)
-        stats = r.json()
-        signals["btc_hash_rate_th"]     = round(stats.get("hash_rate", 0) / 1e12, 2)
-        signals["btc_mempool_size_mb"]  = round(stats.get("mempool_size", 0) / 1e6, 2)
-        signals["btc_tx_per_second"]    = round(stats.get("n_tx_per_block", 0) / 600, 2)
-        signals["btc_difficulty"]       = stats.get("difficulty", 0)
-        # High mempool = network congestion = lots of activity
-        signals["network_activity"] = (
-            "very_high" if signals["btc_mempool_size_mb"] > 50
-            else "high" if signals["btc_mempool_size_mb"] > 20
-            else "normal"
-        )
-    except Exception as e:
-        signals["error"] = str(e)
-    return signals
-
-
 def get_market_dominance() -> dict:
-    """BTC dominance from CoinGecko (free, no key needed)."""
     try:
-        r = httpx.get(
-            "https://api.coingecko.com/api/v3/global",
-            headers={"Accept": "application/json"},
-            timeout=10
-        )
+        r    = httpx.get("https://api.coingecko.com/api/v3/global",
+                         headers={"Accept": "application/json"}, timeout=10)
         data = r.json().get("data", {})
         dom  = data.get("market_cap_percentage", {})
-        total_mcap = data.get("total_market_cap", {}).get("usd", 0)
         return {
-            "btc_dominance":    round(dom.get("btc", 0), 1),
-            "eth_dominance":    round(dom.get("eth", 0), 1),
-            "total_mcap_usd":   total_mcap,
-            "market_cap_change_24h": round(data.get("market_cap_change_percentage_24h_usd", 0), 2),
+            "btc_dominance": round(dom.get("btc", 0), 1),
+            "eth_dominance": round(dom.get("eth", 0), 1),
+            "total_mcap":    data.get("total_market_cap", {}).get("usd", 0),
+            "mcap_24h_pct":  round(data.get("market_cap_change_percentage_24h_usd", 0), 2),
             "signal": (
-                "alt_season"   if dom.get("btc", 50) < 42 else
-                "btc_season"   if dom.get("btc", 50) > 58 else
+                "ALT SEASON — BTC dominance low, alts outperforming" if dom.get("btc", 50) < 42 else
+                "BTC SEASON — rotate into BTC/ETH"                   if dom.get("btc", 50) > 58 else
                 "balanced"
             ),
         }
@@ -163,18 +153,88 @@ def get_market_dominance() -> dict:
         return {"error": str(e)}
 
 
-def get_4h_candles(product_id: str, count: int = 48) -> list:
-    """Last N 4-hour candles for intraday momentum."""
-    end   = int(time.time())
-    start = end - count * 4 * 3600
+def get_trending_and_sentiment() -> dict:
+    """CoinGecko: trending searches + top movers + volume spikes = crowd sentiment."""
+    result = {}
     try:
-        data    = _cb_get(f"/api/v3/brokerage/products/{product_id}/candles",
-                          {"start": str(start), "end": str(end), "granularity": "SIX_HOUR"})
-        candles = data.get("candles", [])
-        candles.sort(key=lambda c: c["start"])
-        return candles
-    except Exception:
-        return []
+        # Trending search coins (what people are searching right now)
+        r = httpx.get("https://api.coingecko.com/api/v3/search/trending", timeout=10)
+        if r.status_code == 200:
+            trending = r.json().get("coins", [])
+            result["trending_searches"] = [
+                {"symbol": c["item"]["symbol"].upper(),
+                 "name":   c["item"]["name"],
+                 "rank":   c["item"]["market_cap_rank"]}
+                for c in trending[:7]
+            ]
+    except Exception as e:
+        result["trending_error"] = str(e)
+
+    try:
+        # Top 20 coins by market cap with 24h/7d changes + volume
+        r2 = httpx.get(
+            "https://api.coingecko.com/api/v3/coins/markets"
+            "?vs_currency=usd&order=market_cap_desc&per_page=20&page=1"
+            "&sparkline=false&price_change_percentage=24h,7d",
+            timeout=10,
+        )
+        if r2.status_code == 200:
+            coins = r2.json()
+            # Find volume spikes (volume > 2x normal using 24h volume vs mcap ratio)
+            movers = []
+            for c in coins:
+                sym = c["symbol"].upper()
+                change_24h = c.get("price_change_percentage_24h") or 0
+                change_7d  = c.get("price_change_percentage_7d_in_currency") or 0
+                vol        = c.get("total_volume") or 0
+                mcap       = c.get("market_cap") or 1
+                vol_ratio  = vol / mcap   # >0.3 = high volume day
+
+                cb_pair = CG_TO_CB.get(c["symbol"].lower())
+                if cb_pair:
+                    movers.append({
+                        "symbol":     cb_pair,
+                        "price":      c["current_price"],
+                        "change_24h": round(change_24h, 2),
+                        "change_7d":  round(change_7d, 2),
+                        "vol_ratio":  round(vol_ratio, 3),
+                        "volume_signal": (
+                            "HIGH VOLUME — strong conviction move" if vol_ratio > 0.3 else
+                            "normal"
+                        ),
+                    })
+
+            # Sort by absolute 24h move — biggest movers first
+            movers.sort(key=lambda x: abs(x["change_24h"]), reverse=True)
+            result["top_movers"]    = movers[:8]
+            result["biggest_drop"]  = min(movers, key=lambda x: x["change_24h"]) if movers else None
+            result["biggest_gainer"]= max(movers, key=lambda x: x["change_24h"]) if movers else None
+    except Exception as e:
+        result["movers_error"] = str(e)
+
+    result["interpretation"] = (
+        "Trending coins = crowd interest, often precede pumps. "
+        "High vol_ratio (>0.3) = strong institutional move. "
+        "Coins down 5-15% on high volume but NOT trending = potential dip buy. "
+        "Coins up 10%+ already = usually too late, wait for pullback."
+    )
+    return result
+
+
+def get_onchain_signals() -> dict:
+    try:
+        r = httpx.get("https://api.blockchain.info/stats", timeout=10)
+        if r.status_code != 200:
+            return {"error": f"HTTP {r.status_code}"}
+        stats = r.json()
+        mempool_mb = round(stats.get("mempool_size", 0) / 1e6, 2)
+        return {
+            "btc_mempool_mb":   mempool_mb,
+            "btc_difficulty":   stats.get("difficulty", 0),
+            "network_activity": "high" if mempool_mb > 20 else "normal",
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ── Coinbase Data ──────────────────────────────────────────────────────────────
@@ -190,12 +250,13 @@ def _get_price(product_id: str) -> float:
         return 0.0
 
 
-def _get_daily_candles(product_id: str, days: int = 30) -> list:
-    end   = int(time.time())
-    start = end - days * 86400
+def _get_candles(product_id: str, granularity: str = "ONE_DAY", count: int = 30) -> list:
+    secs_per = {"ONE_DAY": 86400, "SIX_HOUR": 21600, "TWO_HOUR": 7200, "ONE_HOUR": 3600}
+    end      = int(time.time())
+    start    = end - count * secs_per.get(granularity, 86400)
     try:
         data    = _cb_get(f"/api/v3/brokerage/products/{product_id}/candles",
-                          {"start": str(start), "end": str(end), "granularity": "ONE_DAY"})
+                          {"start": str(start), "end": str(end), "granularity": granularity})
         candles = data.get("candles", [])
         candles.sort(key=lambda c: c["start"])
         return candles
@@ -215,58 +276,77 @@ def _get_portfolio() -> dict:
             usd = avail
         elif avail > 0.0:
             holdings[cur] = avail
-    return {"usd": usd, "holdings": holdings}
+    return {"usd": round(usd, 2), "holdings": holdings}
 
 
-def _full_market_data(product_id: str) -> dict:
-    daily   = _get_daily_candles(product_id, days=30)
-    intra   = get_4h_candles(product_id, count=24)
-    closes  = [float(c["close"]) for c in daily]
-    highs   = [float(c["high"])  for c in daily]
-    lows    = [float(c["low"])   for c in daily]
-    price   = _get_price(product_id)
-    if not closes:
+def _analyze_coin(product_id: str) -> dict:
+    daily = _get_candles(product_id, "ONE_DAY",  30)
+    intra = _get_candles(product_id, "TWO_HOUR", 24)
+    if not daily:
         return {"error": f"No data for {product_id}"}
 
-    ma7  = sum(closes[-7:])  / min(7,  len(closes))
-    ma14 = sum(closes[-14:]) / min(14, len(closes))
-    ma30 = sum(closes)       / len(closes)
+    closes = [float(c["close"]) for c in daily]
+    highs  = [float(c["high"])  for c in daily]
+    lows   = [float(c["low"])   for c in daily]
+    vols   = [float(c.get("volume", 0)) for c in daily]
+    price  = _get_price(product_id)
 
-    change_24h = (closes[-1] - closes[-2]) / closes[-2] * 100 if len(closes) >= 2 else 0
-    change_7d  = (closes[-1] - closes[-7]) / closes[-7] * 100 if len(closes) >= 7 else 0
+    def ma(n):
+        w = closes[-n:]
+        return sum(w) / len(w) if w else price
 
+    ma7, ma14, ma30 = ma(7), ma(14), ma(30)
+
+    # ATR14
     trs   = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
              for i in range(1, len(daily))]
     atr14 = sum(trs[-14:]) / min(14, len(trs)) if trs else price * 0.05
 
-    gains  = [max(0, closes[i]-closes[i-1]) for i in range(max(1, len(closes)-14), len(closes))]
-    losses = [max(0, closes[i-1]-closes[i]) for i in range(max(1, len(closes)-14), len(closes))]
-    ag, al = sum(gains)/14 if gains else 0, sum(losses)/14 if losses else 1
-    rsi14  = round(100 - (100 / (1 + ag/al)), 1) if al > 0 else 100
+    # RSI14
+    diffs  = [closes[i] - closes[i-1] for i in range(max(1, len(closes)-15), len(closes))]
+    gains  = [max(0, d) for d in diffs]
+    losses = [max(0, -d) for d in diffs]
+    ag, al = sum(gains)/14, sum(losses)/14
+    rsi14  = round(100 - (100/(1 + ag/al)), 1) if al > 0 else 100
 
-    # 4h trend
-    intra_closes = [float(c["close"]) for c in intra]
-    intra_trend  = "up" if (len(intra_closes) >= 2 and intra_closes[-1] > intra_closes[-4]) else "down"
+    # Volume spike (today vs 20d avg)
+    avg_vol  = sum(vols[-20:]) / min(20, len(vols)) if vols else 1
+    vol_spike = round(vols[-1] / avg_vol, 2) if avg_vol > 0 else 1
 
-    # Support / resistance (simple: 14d high and low)
-    support    = round(min(lows[-14:]),  4) if len(lows) >= 14 else None
-    resistance = round(max(highs[-14:]), 4) if len(highs) >= 14 else None
+    # 2h trend
+    i_closes = [float(c["close"]) for c in intra]
+    trend_2h = "up" if (len(i_closes) >= 4 and i_closes[-1] > i_closes[-4]) else "down"
+
+    change_24h = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if len(closes) >= 2 else 0
+    change_7d  = round((closes[-1] - closes[-7]) / closes[-7] * 100, 2) if len(closes) >= 7 else 0
+
+    # Simple setup classification
+    setup = "none"
+    if rsi14 < 32 and trend_2h == "up":
+        setup = "OVERSOLD_DIP_BUY — RSI<32, 2h turning up"
+    elif rsi14 < 40 and price < ma14 * 0.95:
+        setup = "DIP_BUY — oversold below MA14"
+    elif price > ma7 > ma14 and vol_spike > 1.5 and trend_2h == "up":
+        setup = "MOMENTUM_BREAKOUT — above MAs, high volume, 2h up"
+    elif rsi14 > 70:
+        setup = "OVERBOUGHT — consider taking profits if holding"
 
     return {
         "product_id":     product_id,
-        "price":          round(price, 4),
-        "change_24h_pct": round(change_24h, 2),
-        "change_7d_pct":  round(change_7d, 2),
-        "ma7":            round(ma7,  4),
+        "price":          round(price, 6),
+        "change_24h_pct": change_24h,
+        "change_7d_pct":  change_7d,
+        "rsi14":          rsi14,
+        "ma7":            round(ma7, 4),
         "ma14":           round(ma14, 4),
         "ma30":           round(ma30, 4),
         "price_vs_ma14":  round((price - ma14) / ma14 * 100, 2) if ma14 else None,
-        "atr14":          round(atr14, 4),
-        "atr_pct":        round(atr14 / price * 100, 2) if price else None,
-        "rsi14":          rsi14,
-        "intraday_trend": intra_trend,
-        "support_14d":    support,
-        "resistance_14d": resistance,
+        "atr14_pct":      round(atr14 / price * 100, 2) if price else None,
+        "vol_spike":      vol_spike,
+        "trend_2h":       trend_2h,
+        "support_14d":    round(min(lows[-14:]), 6) if len(lows) >= 14 else None,
+        "resistance_14d": round(max(highs[-14:]), 6) if len(highs) >= 14 else None,
+        "setup":          setup,
     }
 
 
@@ -274,10 +354,11 @@ def _full_market_data(product_id: str) -> dict:
 
 def _place_order(product_id: str, side: str, usd_amount: float,
                  signal_type: str, setup_notes: str, market_regime: str) -> dict:
+    price = _get_price(product_id)
+    qty   = usd_amount / price if price > 0 else 0
+
     if PAPER:
-        fake_id = f"PAPER-CRYPTO-{product_id}-{int(time.time())}"
-        price   = _get_price(product_id)
-        qty     = usd_amount / price if price > 0 else 0
+        fake_id = f"PAPER-{product_id}-{int(time.time())}"
         print(f"  [PAPER] {side} ${usd_amount:.2f} of {product_id} @ ${price:.4f}")
         tdb.open_trade(order_id=fake_id, symbol=product_id, side=side.lower(),
                        qty=qty, entry_price=price, signal_type=signal_type,
@@ -294,8 +375,7 @@ def _place_order(product_id: str, side: str, usd_amount: float,
     resp     = _cb_post("/api/v3/brokerage/orders", body)
     order    = resp.get("success_response", {})
     order_id = order.get("order_id", client_order_id)
-    price    = _get_price(product_id)
-    qty      = usd_amount / price if price > 0 else 0
+    print(f"  [LIVE] {side} ${usd_amount:.2f} of {product_id} @ ${price:.4f} → order {order_id}")
     tdb.open_trade(order_id=order_id, symbol=product_id, side=side.lower(),
                    qty=qty, entry_price=price, signal_type=signal_type,
                    setup_notes=setup_notes, market_regime=market_regime)
@@ -307,61 +387,63 @@ def _place_order(product_id: str, side: str, usd_amount: float,
 TOOLS = [
     {
         "name": "get_portfolio",
-        "description": "Get current USD cash balance and all crypto holdings.",
+        "description": "Current USD balance and all crypto holdings.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "get_market_data",
-        "description": "Price, RSI, MA, 4h trend, support/resistance for a crypto pair.",
+        "name": "get_market_intelligence",
+        "description": (
+            "Fear & Greed index, funding rates, BTC dominance, on-chain signals, "
+            "trending coins, top movers, volume spikes. Call this FIRST every session."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "analyze_coin",
+        "description": "Deep analysis of a single coin: RSI, MAs, volume spike, 2h trend, support/resistance, setup classification.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "product_id": {"type": "string", "description": "e.g. BTC-USD"}
+                "product_id": {"type": "string", "description": "e.g. BTC-USD, SOL-USD, XRP-USD"}
             },
             "required": ["product_id"],
         },
     },
     {
-        "name": "get_market_intelligence",
-        "description": "Fear & Greed index, BTC dominance, funding rates, and on-chain signals. Call this every session — it's your market edge.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
         "name": "get_historical_context",
-        "description": "6-year historical stats (52w range, avg returns, MA levels) from DB.",
+        "description": "6-year historical stats for a coin from the trading DB.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "symbol": {"type": "string", "description": "e.g. BTC-USD"}
-            },
+            "properties": {"symbol": {"type": "string"}},
             "required": ["symbol"],
         },
     },
     {
         "name": "get_performance_stats",
-        "description": "All-time win rate, PnL, breakdown by symbol/signal from every past crypto trade.",
+        "description": "Win rate, PnL, and breakdown by symbol/signal from all past trades.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "buy_crypto",
-        "description": "Buy a crypto pair with a specified USD amount (live market order).",
+        "description": "Execute a live BUY market order on Coinbase.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "product_id":  {"type": "string"},
-                "usd_amount":  {"type": "number", "description": "USD to spend"},
+                "usd_amount":  {"type": "number"},
                 "signal_type": {
                     "type": "string",
-                    "enum": ["momentum", "mean_reversion", "breakout", "dip_buy", "fear_greed", "funding_squeeze"]
+                    "enum": ["momentum", "mean_reversion", "breakout", "dip_buy",
+                             "fear_greed", "funding_squeeze", "volume_spike", "trending"]
                 },
-                "reasoning":   {"type": "string", "description": "Full trade rationale including what intel drove this"},
+                "reasoning": {"type": "string"},
             },
             "required": ["product_id", "usd_amount", "signal_type", "reasoning"],
         },
     },
     {
         "name": "sell_crypto",
-        "description": "Sell a crypto pair (live market order, specify USD worth to sell).",
+        "description": "Execute a live SELL market order on Coinbase.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -370,7 +452,8 @@ TOOLS = [
                 "reasoning":   {"type": "string"},
                 "exit_reason": {
                     "type": "string",
-                    "enum": ["take_profit", "stop_loss", "regime_change", "rebalance", "fear_spike"]
+                    "enum": ["take_profit", "stop_loss", "regime_change",
+                             "rebalance", "fear_spike", "overbought"]
                 },
             },
             "required": ["product_id", "usd_amount", "reasoning", "exit_reason"],
@@ -378,7 +461,7 @@ TOOLS = [
     },
     {
         "name": "skip_session",
-        "description": "Skip this session. Use when market is unclear or all setups are weak.",
+        "description": "Skip this session when no clear setup exists.",
         "input_schema": {
             "type": "object",
             "properties": {"reason": {"type": "string"}},
@@ -388,33 +471,27 @@ TOOLS = [
 ]
 
 
-def _handle_tool(name: str, inp: dict, market_regime: str) -> str:
+def _handle_tool(name: str, inp: dict, regime: str) -> str:
     try:
         if name == "get_portfolio":
             return json.dumps(_get_portfolio())
 
-        elif name == "get_market_data":
-            return json.dumps(_full_market_data(inp["product_id"]))
-
         elif name == "get_market_intelligence":
             fg      = get_fear_and_greed()
             funding = get_funding_rates()
-            onchain = get_onchain_signals()
             dom     = get_market_dominance()
+            trend   = get_trending_and_sentiment()
+            onchain = get_onchain_signals()
             return json.dumps({
-                "fear_and_greed":  fg,
-                "funding_rates":   funding,
-                "onchain_signals": onchain,
-                "market_dominance": dom,
-                "interpretation": (
-                    "EXTREME FEAR = historically best buying opportunity. "
-                    "EXTREME GREED = consider taking profits. "
-                    "Negative funding = shorts crowded, potential squeeze up. "
-                    "Positive funding >0.1% = longs crowded, reversal risk. "
-                    "BTC dominance rising = rotate INTO BTC. "
-                    "BTC dominance falling = alt season, rotate into alts."
-                ),
+                "fear_and_greed":   fg,
+                "funding_rates":    funding,
+                "dominance":        dom,
+                "sentiment":        trend,
+                "onchain":          onchain,
             })
+
+        elif name == "analyze_coin":
+            return json.dumps(_analyze_coin(inp["product_id"]))
 
         elif name == "get_historical_context":
             return json.dumps(tdb.get_historical_stats(inp["symbol"]))
@@ -426,20 +503,24 @@ def _handle_tool(name: str, inp: dict, market_regime: str) -> str:
             pid  = inp["product_id"]
             usd  = float(inp["usd_amount"])
             port = _get_portfolio()
-            max_trade = port["usd"] * MAX_POSITION_PCT
-            if usd > max_trade:
-                usd = round(max_trade, 2)
+            total = port["usd"]
+            # reserve MIN_USD_RESERVE of current balance
+            max_trade = total * MAX_POSITION_PCT
+            min_reserve = (total + sum(
+                _get_price(f"{cur}-USD") * qty
+                for cur, qty in port.get("holdings", {}).items()
+            )) * MIN_USD_RESERVE
+            available = max(0, total - min_reserve)
+            usd = min(usd, max_trade, available)
             if usd < 1.0:
-                return json.dumps({"error": "Insufficient USD (< $1)"})
-            result = _place_order(pid, "BUY", usd,
-                                  inp["signal_type"], inp["reasoning"], market_regime)
+                return json.dumps({"error": "Insufficient free USD (< $1 after reserve)"})
+            result = _place_order(pid, "BUY", usd, inp["signal_type"],
+                                  inp["reasoning"], regime)
             return json.dumps(result)
 
         elif name == "sell_crypto":
-            pid    = inp["product_id"]
-            usd    = float(inp["usd_amount"])
-            result = _place_order(pid, "SELL", usd,
-                                  inp.get("exit_reason", "exit"), inp["reasoning"], market_regime)
+            result = _place_order(inp["product_id"], "SELL", float(inp["usd_amount"]),
+                                  inp.get("exit_reason", "exit"), inp["reasoning"], regime)
             return json.dumps(result)
 
         elif name == "skip_session":
@@ -452,18 +533,18 @@ def _handle_tool(name: str, inp: dict, market_regime: str) -> str:
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
-# ── Regime Detection ──────────────────────────────────────────────────────────
+# ── Regime ────────────────────────────────────────────────────────────────────
 
 def _detect_regime() -> str:
     try:
-        candles    = _get_daily_candles("BTC-USD", days=60)
+        candles    = _get_candles("BTC-USD", "ONE_DAY", 60)
         closes     = [float(c["close"]) for c in candles]
         if len(closes) < 7:
             return "unknown"
         change_24h = (closes[-1] - closes[-2]) / closes[-2] * 100 if len(closes) >= 2 else 0
-        if change_24h < -8:
+        if change_24h < -CRASH_THRESHOLD * 100:
             return "crash_risk"
-        ma7  = sum(closes[-7:])  / 7
+        ma7  = sum(closes[-7:]) / 7
         ma30 = sum(closes[-30:]) / 30 if len(closes) >= 30 else sum(closes) / len(closes)
         if ma7 > ma30 * 1.03:
             return "bull_trend"
@@ -480,34 +561,44 @@ def _build_system(regime: str) -> str:
     notes = tdb.get_latest_strategy_notes(limit=2)
     stats = tdb.get_performance_stats()
     return f"""You are an aggressive crypto trading agent managing a live Coinbase portfolio.
-Your goal is to MAXIMIZE DAILY PROFIT. Crypto runs 24/7 and you run every 4 hours.
+Goal: MAXIMIZE DAILY PROFIT. You run every 2 hours, 24/7 across 10 coins.
 
-## Current Market Regime: {regime}
+## Market Regime: {regime}
+## Watchlist: {', '.join(WATCHLIST)}
 
-## Trading Strategy
-- ALWAYS call get_market_intelligence first — Fear & Greed + funding rates are your biggest edge
-- Fear & Greed < 25 (extreme fear): BUY aggressively — these are the best entries historically
-- Fear & Greed > 75 (extreme greed): Take profits, don't chase
-- Funding rate > 0.1%: Longs very crowded → mean reversion short or avoid longs
-- Funding rate < -0.05%: Shorts crowded → long squeeze setup, buy the dip
-- BTC dominance rising: prioritize BTC/ETH over altcoins
-- BTC dominance falling: alts outperform, diversify into SOL/DOGE/AVAX
-- RSI < 35 on daily + 4h trend turning up = strong buy signal
-- RSI > 70 on daily = reduce position, take partial profits
+## Session Playbook
+1. ALWAYS call get_market_intelligence first — this is your edge
+2. Use trending_searches + top_movers to spot which coins have momentum RIGHT NOW
+3. For any promising coin, call analyze_coin to get RSI, volume spike, 2h trend
+4. Cross-reference: coin trending + oversold RSI + volume spike = highest conviction buy
+5. Execute 1-3 trades max per session — quality over quantity
 
-## Risk Rules (non-negotiable)
+## Signal Interpretation
+- Fear & Greed < 20: Extreme fear = STRONG BUY signal (historically best entries)
+- Fear & Greed > 80: Extreme greed = take profits, don't open new longs
+- Funding rate > 0.1%: Longs crowded → avoid new longs, look for short squeeze on alts
+- Funding rate < -0.05%: Shorts crowded → long squeeze incoming, buy the dip
+- Coin in trending_searches + RSI < 40: High probability setup
+- vol_spike > 2.0: Institutional buying, strong signal
+- setup = "OVERSOLD_DIP_BUY": Highest conviction — RSI<32 with 2h reversal
+- BTC dominance falling: Rotate into alts (SOL, XRP, LINK, ADA)
+- BTC dominance rising: Stick to BTC/ETH
+
+## Tightened Risk Rules
 - Max 25% of portfolio per trade
-- Keep at least 20% in USD at all times (dry powder for dips)
-- Daily loss limit: if portfolio drops 15% today, stop all trading
-- If BTC drops 8%+ in 24h, skip session (already checked before you run)
+- Always keep 20% in USD (dry powder)
+- Stop loss: 3% below entry (mentally — close losing positions next session)
+- Take profit: 8% gain target
+- If BTC dropped 8%+ in last 24h → already blocked, won't reach you
+- Daily loss limit: 15% of portfolio → stop all trading
 
 ## Performance Stats
 {json.dumps(stats, indent=2) if isinstance(stats, dict) else "No closed trades yet."}
 
 ## Strategy Notes from Weekly Self-Review
-{chr(10).join(n['content'][:600] for n in notes) if notes else "No reviews yet — still learning."}
+{chr(10).join(n['content'][:500] for n in notes) if notes else "Still learning — no reviews yet."}
 
-Be decisive. When you see a clear setup, take it. When you don't, skip. Don't over-trade.
+Be aggressive on clear setups. Skip when uncertain. Every trade needs a reason.
 """
 
 
@@ -523,28 +614,25 @@ def run_crypto_session():
 
     regime = _detect_regime()
     print(f"[crypto] Regime: {regime}")
-
     if regime == "crash_risk":
-        print("[crypto] BTC crash detected — skipping to preserve capital")
+        print("[crypto] BTC crash detected — preserving capital, skipping")
         return
 
     messages = [{
         "role": "user",
         "content": (
-            f"Time: {now_str}\n"
-            f"Regime: {regime} | Mode: {'PAPER' if PAPER else 'LIVE — real money'}\n"
+            f"Time: {now_str} | Regime: {regime} | {'LIVE' if not PAPER else 'PAPER'}\n"
             f"Watchlist: {', '.join(WATCHLIST)}\n\n"
-            "Run your analysis and trade if there's a clear opportunity:\n"
-            "1. get_market_intelligence — always start here\n"
-            "2. get_portfolio — see your balance\n"
-            "3. get_market_data for coins that look interesting based on intel\n"
-            "4. get_performance_stats to know what setups have worked\n"
-            "5. Execute trades or skip_session\n"
-            "Goal: maximize profit today. Be aggressive on clear setups."
+            "Run your session:\n"
+            "1. get_market_intelligence → identify best opportunities\n"
+            "2. analyze_coin on the most promising ones\n"
+            "3. get_portfolio → check available cash\n"
+            "4. Execute trades or skip_session\n"
+            "Maximize profit. Be decisive."
         ),
     }]
 
-    for _turn in range(16):
+    for _turn in range(20):
         resp = _client.messages.create(
             model="claude-opus-4-8",
             max_tokens=4096,
@@ -556,7 +644,7 @@ def run_crypto_session():
         if resp.stop_reason == "end_turn":
             for block in resp.content:
                 if hasattr(block, "text") and block.text:
-                    print(f"[crypto] {block.text[:500]}")
+                    print(f"[crypto] {block.text[:600]}")
             break
 
         if resp.stop_reason != "tool_use":
