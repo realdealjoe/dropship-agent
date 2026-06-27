@@ -106,6 +106,17 @@ def _trading_weekly_review():
     print(f"[scheduler] Weekly review done:\n{result[:500]}\n")
 
 
+# ── Meme coin trading agent ───────────────────────────────────────────────────
+
+def _meme_session():
+    from config import COINBASE_API_KEY_NAME
+    if not COINBASE_API_KEY_NAME:
+        return
+    from agents.meme_trading import run_meme_session
+    print("\n[scheduler] Running meme coin session...")
+    run_meme_session()
+
+
 # ── Crypto trading agent ─────────────────────────────────────────────────────
 
 def _crypto_session():
@@ -161,5 +172,9 @@ def build_scheduler() -> BackgroundScheduler:
     # Crypto trading — every 2 hours, 24/7
     scheduler.add_job(_crypto_session,        CronTrigger(hour="*/2"),
                       id="crypto_trading",    replace_existing=True)
+
+    # Meme coin trading — every hour, 24/7
+    scheduler.add_job(_meme_session,          CronTrigger(minute=30),
+                      id="meme_trading",      replace_existing=True)
 
     return scheduler
