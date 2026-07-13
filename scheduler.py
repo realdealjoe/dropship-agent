@@ -7,10 +7,14 @@ Schedule (all times UTC):
   02:00 Sunday    Product sourcing
   03:00 Saturday  SEO pass
   06:00 daily     Repricing
+  08:00 daily     Gambling — morning lines scan
   12:00 Tue/Fri   Social media posts
   13:35 Mon-Fri   Stock trading — morning session
+  19:00 daily     Gambling — evening games scan
   19:45 Mon-Fri   Stock trading — end-of-day session
-  */4 hours       Order tracking sync + crypto trading
+  */2 hours       Crypto trading
+  */1 hour :30    Meme coin trading
+  */4 hours       Order tracking sync
 """
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -106,6 +110,42 @@ def _trading_weekly_review():
     print(f"[scheduler] Weekly review done:\n{result[:500]}\n")
 
 
+# ── Gambling / Sports betting agent ──────────────────────────────────────────
+
+def _gambling_session():
+    from config import ODDS_API_KEY
+    if not ODDS_API_KEY:
+        print("[scheduler] Gambling: ODDS_API_KEY not set, skipping")
+        return
+    from agents.gambling_bot import run_gambling_session
+    print("\n[scheduler] Running gambling session...")
+    run_gambling_session()
+
+
+def _kalshi_session():
+    import os
+    if not os.getenv("KALSHI_API_KEY"):
+        return
+    from agents.kalshi_bot import run_kalshi_session
+    print("\n[scheduler] Running Kalshi session...")
+    run_kalshi_session()
+
+
+# ── Painless Sleep AliExpress fulfillment ────────────────────────────────────
+
+def _ps_tracking_sync():
+    from agents.alibaba_fulfillment_agent import run_fulfillment_check
+    run_fulfillment_check()
+
+
+# ── Brooke affiliate agent ───────────────────────────────────────────────────
+
+def _brooke_affiliate_session():
+    from agents.brooke_affiliate_agent import run_affiliate_session
+    print("\n[scheduler] Running Brooke affiliate session...")
+    run_affiliate_session()
+
+
 # ── Meme coin trading agent ───────────────────────────────────────────────────
 
 def _meme_session():
@@ -176,5 +216,42 @@ def build_scheduler() -> BackgroundScheduler:
     # Meme coin trading — every hour, 24/7
     scheduler.add_job(_meme_session,          CronTrigger(minute=30),
                       id="meme_trading",      replace_existing=True)
+
+    # Gambling — 5 sessions covering all major game windows (UTC):
+    #   07:00 pre-European/morning lines
+    #   12:00 midday — early afternoon kickoffs
+    #   16:00 pre-US afternoon games
+    #   19:00 US evening games / UEFA kickoffs
+    #   23:00 late US games / overnight lines
+    scheduler.add_job(_gambling_session, CronTrigger(hour=7),
+                      id="gambling_0700", replace_existing=True)
+    scheduler.add_job(_gambling_session, CronTrigger(hour=12),
+                      id="gambling_1200", replace_existing=True)
+    scheduler.add_job(_gambling_session, CronTrigger(hour=16),
+                      id="gambling_1600", replace_existing=True)
+    scheduler.add_job(_gambling_session, CronTrigger(hour=19),
+                      id="gambling_1900", replace_existing=True)
+    scheduler.add_job(_gambling_session, CronTrigger(hour=23),
+                      id="gambling_2300", replace_existing=True)
+
+    # Painless Sleep — check AliExpress tracking every 2 hours
+    scheduler.add_job(_ps_tracking_sync, CronTrigger(minute="0", hour="*/2"),
+                      id="ps_tracking_sync", replace_existing=True)
+
+    # Brooke affiliate — every 30 min to catch new posts quickly
+    scheduler.add_job(_brooke_affiliate_session, CronTrigger(minute="0,30"),
+                      id="brooke_affiliate", replace_existing=True)
+
+    # Kalshi — runs alongside Polymarket at same times
+    scheduler.add_job(_kalshi_session, CronTrigger(hour=7),
+                      id="kalshi_0700", replace_existing=True)
+    scheduler.add_job(_kalshi_session, CronTrigger(hour=12),
+                      id="kalshi_1200", replace_existing=True)
+    scheduler.add_job(_kalshi_session, CronTrigger(hour=16),
+                      id="kalshi_1600", replace_existing=True)
+    scheduler.add_job(_kalshi_session, CronTrigger(hour=19),
+                      id="kalshi_1900", replace_existing=True)
+    scheduler.add_job(_kalshi_session, CronTrigger(hour=23),
+                      id="kalshi_2300", replace_existing=True)
 
     return scheduler
